@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.spec
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local settings
+.export_conversation_bulles_libreoffice_settings.json
+
+# Test/export files
+*.docx
+*.xlsx
+*.xls
+*.csv
+*.tmp
