@@ -24,6 +24,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser, ttk
 from typing import Optional
+from signal_json_import import load_signal_json, inspect_media_paths
 
 import pandas as pd
 import customtkinter as ctk
@@ -639,6 +640,7 @@ def export_chat_to_docx(
     sender_font_size: int = 9,
     msg_font_size: int = 10,
     meta_font_size: int = 8,
+    strict_media_lookup: bool = False,
 ):
     doc = Document()
 
@@ -832,10 +834,18 @@ def export_chat_to_docx(
 
         # Medias
         for media_name in media_values:
-            resolved = (
-                resolve_media_path(media_name, files_root, recursive=search_subfolders, fuzzy=fuzzy_match)
-                or resolve_media_path(media_name, str(out_dir), recursive=True, fuzzy=True)
-            )
+            if strict_media_lookup:
+                # Signal media: exact path only, never associate by fuzzy name.
+                rel_path = Path(media_name)
+                resolved = None
+                if files_root and not rel_path.is_absolute() and ".." not in rel_path.parts:
+                    candidate = Path(files_root) / rel_path
+                    resolved = str(candidate) if candidate.is_file() else None
+            else:
+                resolved = (
+                    resolve_media_path(media_name, files_root, recursive=search_subfolders, fuzzy=fuzzy_match)
+                    or resolve_media_path(media_name, str(out_dir), recursive=True, fuzzy=True)
+                )
 
             p_media = bubble_cell.add_paragraph()
             compact_paragraph(p_media)
@@ -980,11 +990,14 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
-        self.title("Export conversation Excel -> LibreOffice Writer (bulles V4) — Dark Pro")
+        self.title("Export conversation Excel / Signal -> LibreOffice Writer (bulles) — Dark Pro")
         self.geometry("1500x880")
         self.minsize(1200, 720)
 
         self.excel_path: str | None = None
+        self.source_kind = "excel"
+        self.signal_rows: list[dict] = []
+        self.signal_meta: dict = {}
         self.df: pd.DataFrame | None = None
         self.sheets: list[str] = []
 
@@ -1145,8 +1158,11 @@ class App(ctk.CTk):
         self.refresh_current_sheet()
 
     def refresh_current_sheet(self):
-        """Rafraîchit la feuille courante (relecture Excel + mise à jour UI)."""
+        """Rafraîchit la feuille Excel ou le filtre de conversation Signal."""
         if not self.excel_path:
+            return
+        if self.source_kind == "signal_json":
+            self.load_sheet()
             return
 
         try:
@@ -1179,9 +1195,12 @@ class App(ctk.CTk):
         top.pack(fill="x", padx=12, pady=12)
 
         ctk.CTkButton(top, text="Ouvrir Excel…", width=140, command=self.open_excel).pack(
-            side="left", padx=12, pady=10
+            side="left", padx=(12, 4), pady=10
         )
-        ctk.CTkLabel(top, text="Feuille").pack(side="left", padx=(12, 8))
+        ctk.CTkButton(top, text="Ouvrir Signal JSON…", width=155, command=self.open_signal_json).pack(
+            side="left", padx=(0, 8), pady=10
+        )
+        ctk.CTkLabel(top, text="Feuille / conversation").pack(side="left", padx=(8, 8))
 
         self.sheet_menu = ctk.CTkOptionMenu(top, variable=self.sheet_var, values=[""], command=self.on_sheet_change)
         self.sheet_menu.pack(side="left", pady=10)
@@ -1982,6 +2001,9 @@ class App(ctk.CTk):
         if not path:
             return
 
+        self.source_kind = "excel"
+        self.signal_rows = []
+        self.signal_meta = {}
         self.excel_path = path
         self.lbl_file.configure(text=os.path.basename(path))
 
@@ -1994,15 +2016,83 @@ class App(ctk.CTk):
             self.sheet_var.set("")
         self.load_sheet()
 
+    def open_signal_json(self):
+        path = filedialog.askopenfilename(
+            title="Choisir un export Signal conversations.json",
+            filetypes=[("Export Signal JSON", "*.json"), ("Tous fichiers", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            rows, metadata = load_signal_json(path)
+            if not rows:
+                raise ValueError("Le fichier ne contient aucun enregistrement de conversation.")
+        except Exception as exc:
+            messagebox.showerror("Import Signal", f"Fichier Signal non exploitable :\n{exc}")
+            return
+
+        # sigbackup typically exports JSON next to the medias/ directory.
+        folder = Path(path).parent
+        possible_roots = [folder / "medias", folder.parent / "medias", folder.parent / "Exports" / "medias"]
+        media_root = next((candidate for candidate in possible_roots if candidate.is_dir()), None)
+        if media_root is None:
+            choice = filedialog.askdirectory(
+                title="Choisir le dossier des médias Signal extraits (annuler = messages seuls)",
+                initialdir=str(folder)
+            )
+            media_root = Path(choice) if choice else None
+
+        self.source_kind = "signal_json"
+        self.excel_path = path
+        self.signal_rows = rows
+        self.signal_meta = metadata
+        self.sheets = ["Toutes les conversations"] + sorted(metadata["per_chat"])
+        self.sheet_menu.configure(values=self.sheets)
+        self.sheet_var.set(self.sheets[0])
+        self.col_sender_var.set("From")
+        self.col_msg_var.set("Body")
+        self.col_dir_var.set("Direction")
+        self.ts_single_var.set("Timestamp")
+        self.ts_mode_var.set("single")
+        self.media_col_var.set("MediaPath")
+        self.side_mode_var.set("direction")
+        self.dedupe_var.set(False)  # Ne pas fusionner des éléments de preuve.
+        self.extra_cols_selected = ["Citation", "Reactions"]
+        self.files_root_var.set(str(media_root) if media_root else "")
+        self.search_subfolders_var.set(False)
+        self.fuzzy_match_var.set(False)
+        self.lbl_file.configure(text=f"Signal : {Path(path).name} ({len(rows)} éléments)")
+        self.load_sheet()
+
+        if media_root:
+            stats = inspect_media_paths(rows, media_root)
+            if stats["missing"]:
+                messagebox.showwarning(
+                    "Médias Signal",
+                    f"{stats['found']}/{stats['expected']} chemins médias résolus exactement.\n"
+                    "Vérifier le dossier des médias dans l'onglet Fichier."
+                )
+        else:
+            messagebox.showinfo(
+                "Médias Signal",
+                "Les messages sont importés. Sélectionner le dossier médias dans l'onglet Fichier "
+                "avant l'export DOCX pour joindre les fichiers."
+            )
+
     def load_sheet(self):
         if not self.excel_path:
             return
 
         sheet = self.sheet_var.get() if self.sheet_var.get() else None
         try:
-            self.df = load_excel_smart(self.excel_path, sheet_name=sheet)
+            if self.source_kind == "signal_json":
+                self.df = pd.DataFrame(self.signal_rows)
+                if sheet and sheet != "Toutes les conversations":
+                    self.df = self.df[self.df["Conversation"] == sheet].copy()
+            else:
+                self.df = load_excel_smart(self.excel_path, sheet_name=sheet)
         except Exception as e:
-            messagebox.showerror("Erreur", f"Impossible de lire l'Excel:\n{e}")
+            messagebox.showerror("Erreur", f"Impossible de charger les conversations :\n{e}")
             return
 
         cols = list(self.df.columns)
@@ -2528,7 +2618,7 @@ class App(ctk.CTk):
 
         df_to_export = self.df
         removed_dupes = 0
-        if self.dedupe_var.get():
+        if self.dedupe_var.get() and self.source_kind != "signal_json":
             try:
                 before_n = int(len(df_to_export))
                 df_to_export = dedupe_messages_option_b(df_to_export, col_sender, col_msg, ts_series)
@@ -2542,6 +2632,17 @@ class App(ctk.CTk):
                 "Doublons supprimés",
                 f"{removed_dupes} ligne(s) supprimée(s) (doublons).\nLignes restantes: {len(df_to_export)}"
             )
+
+        if self.source_kind == "signal_json":
+            metadata = self.signal_meta
+            provenance = (
+                "Source : export secondaire Signal JSON ; "
+                f"SHA-256 : {metadata.get('source_sha256', 'non calculé')} ; "
+                f"sauvegarde : {metadata.get('snapshot', 'non documentée')}. "
+                "Horodatages affichés en heure française ; originaux UTC dans le JSON. "
+                "Export non exhaustif de l'état du téléphone."
+            )
+            intro_text = provenance + ("\n" + intro_text if intro_text else "")
 
         status_col = self.status_col_var.get().strip() or None
         status_map = self.status_map if self.show_status_var.get() else {}
@@ -2570,6 +2671,7 @@ class App(ctk.CTk):
                 bubble_spacing_pt=bubble_spacing,
                 extra_cols=(self.extra_cols_selected if self.extra_cols_selected else None),
                 media_path_col=media_col,
+                strict_media_lookup=(self.source_kind == "signal_json"),
                 files_root=self.files_root_var.get().strip(),
                 search_subfolders=bool(self.search_subfolders_var.get()),
                 fuzzy_match=bool(self.fuzzy_match_var.get()),
