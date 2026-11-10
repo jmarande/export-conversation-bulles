@@ -596,6 +596,132 @@ def make_video_thumbnail(video_path: str, cache_dir: str) -> str | None:
 # -----------------------------
 # DOCX exporter
 # -----------------------------
+
+def _add_signal_contact_overview(doc, df, report, font_name="Calibri"):
+    """Documented conversation contacts only, before any message bubbles."""
+    chosen = list(dict.fromkeys(df["ChatID"].astype(str).tolist()))
+    directory = {}
+    for chat_id in chosen:
+        title_rows = df[df["ChatID"].astype(str) == chat_id]
+        chat_label = str(title_rows.iloc[0].get("Conversation", "Conversation " + chat_id))
+        for person in report.get("participants_by_chat", {}).get(chat_id, []):
+            if not isinstance(person, dict):
+                continue
+            key = str(person.get("aci") or person.get("id") or (
+                str(person.get("name", "")) + "|" + str(person.get("phone", ""))
+            ))
+            entry = directory.setdefault(key, {
+                "name": str(person.get("name") or "Compte non identifié"),
+                "phone": str(person.get("phone") or ""),
+                "aci": str(person.get("aci") or ""),
+                "chats": []
+            })
+            if chat_label not in entry["chats"]:
+                entry["chats"].append(chat_label)
+
+    header = doc.add_paragraph("Répertoire des contacts des conversations")
+    header.style = "Heading 1"
+    note = doc.add_paragraph(
+        "Cette liste concerne uniquement les participants ou auteurs recensés dans les "
+        "conversations sélectionnées. Les noms sont ceux indiqués par l'export Signal ; "
+        "ils ne constituent pas une identification civile certaine."
+    )
+    note.paragraph_format.space_after = Pt(8)
+
+    table = doc.add_table(rows=1, cols=4)
+    table.style = "Table Grid"
+    widths = [3.8, 3.0, 5.8, 5.0]
+    labels = ["Nom / compte", "Téléphone", "Identifiant Signal (ACI)", "Conversation(s)"]
+    for j, label in enumerate(labels):
+        cell = table.rows[0].cells[j]
+        cell.text = label
+        cell.width = Cm(widths[j])
+        set_cell_shading(cell, "253C59")
+        for p in cell.paragraphs:
+            for run in p.runs:
+                run.bold = True
+                run.font.color.rgb = RGBColor(255, 255, 255)
+                run.font.size = Pt(8)
+                run.font.name = font_name
+
+    # Repeat column headings when the contacts table spans multiple pages.
+    trPr = table.rows[0]._tr.get_or_add_trPr()
+    tbl_header = OxmlElement("w:tblHeader")
+    tbl_header.set(qn("w:val"), "true")
+    trPr.append(tbl_header)
+
+    people = sorted(directory.values(), key=lambda p: (p["name"] != "Compte local (Signal)", p["name"].lower()))
+    for person in people:
+        row = table.add_row()
+        values = [person["name"], person["phone"] or "Non renseigné",
+                  person["aci"] or "Non renseigné", "; ".join(person["chats"])]
+        for j, value in enumerate(values):
+            cell = row.cells[j]
+            cell.text = value
+            cell.width = Cm(widths[j])
+            for p in cell.paragraphs:
+                p.paragraph_format.space_after = Pt(0)
+                for run in p.runs:
+                    run.font.name = font_name
+                    run.font.size = Pt(7 if j in (2, 3) else 8)
+        set_row_cant_split(row)
+    if not people:
+        empty = table.add_row().cells
+        empty[0].text = "Aucun participant documenté dans les métadonnées"
+    doc.add_paragraph(
+        f"Contacts/comptes listés : {len(people)}. Conversations sélectionnées : {len(chosen)}."
+    ).style = "Caption"
+
+
+def _add_signal_chat_header(doc, chat_rows, report, ordinal, total, font_name="Calibri"):
+    """A clear title and chat-specific participant/date box on a new page."""
+    row = chat_rows.iloc[0]
+    chat_id = str(row.get("ChatID", ""))
+    name = str(row.get("Conversation", "Conversation " + chat_id))
+    kind = str(report.get("chat_types", {}).get(chat_id, ""))
+    dates = chat_rows.sort_values(["TimestampUTC", "SourceRow"], kind="stable")
+    dated = dates[dates["TimestampUTC"].astype(str).str.strip() != ""]
+    start = str(dated.iloc[0]["Timestamp"]) if not dated.empty else "Non documentée"
+    end = str(dated.iloc[-1]["Timestamp"]) if not dated.empty else "Non documentée"
+    people = report.get("participants_by_chat", {}).get(chat_id, [])
+    participants = ", ".join(str(p.get("name") or "Compte non identifié") for p in people)
+    if not participants:
+        participants = ", ".join(sorted(set(chat_rows["From"].astype(str))))
+
+    p = doc.add_paragraph()
+    p.style = "Heading 1"
+    p.add_run(f"Conversation {ordinal} / {total} — {name}")
+    p.paragraph_format.space_after = Pt(8)
+
+    details = doc.add_table(rows=0, cols=2)
+    details.style = "Table Grid"
+    attributes = [
+        ("Nature", "Groupe Signal" if kind == "group" else "Conversation individuelle" if kind == "contact" else (kind or "Non précisée")),
+        ("Participants / auteurs", participants),
+        ("Premier élément daté", start),
+        ("Dernier élément daté", end),
+        ("Éléments présentés", str(len(chat_rows))),
+    ]
+    for label, value in attributes:
+        cells = details.add_row().cells
+        cells[0].text, cells[1].text = label, value
+        cells[0].width = Cm(4)
+        for pp in cells[0].paragraphs:
+            for run in pp.runs:
+                run.bold = True
+        for cell in cells:
+            for pp in cell.paragraphs:
+                pp.paragraph_format.space_after = Pt(0)
+                for run in pp.runs:
+                    run.font.name = font_name
+                    run.font.size = Pt(9)
+
+    subtitle = doc.add_paragraph("Échanges et événements présents dans l'export")
+    subtitle.style = "Heading 2"
+    subtitle.paragraph_format.space_before = Pt(10)
+    subtitle.paragraph_format.space_after = Pt(6)
+
+
 def export_chat_to_docx(
     df: pd.DataFrame,
     out_path: str,
@@ -641,6 +767,7 @@ def export_chat_to_docx(
     msg_font_size: int = 10,
     meta_font_size: int = 8,
     strict_media_lookup: bool = False,
+    signal_report: dict | None = None,
 ):
     doc = Document()
 
@@ -725,7 +852,32 @@ def export_chat_to_docx(
     bubble_spacing_pt = float(bubble_spacing_pt)
     bubble_spacing_pt = max(0.0, min(bubble_spacing_pt, 40.0))
 
+    signal_chat_groups = {}
+    current_signal_chat = None
+    signal_chat_order = []
+    if signal_report and "ChatID" in df.columns and not df.empty:
+        # Reorganize per conversation, keeping the original message order
+        # within each conversation (stable UTC timestamp/source row).
+        signal_chat_order = list(dict.fromkeys(df["ChatID"].astype(str).tolist()))
+        signal_chat_groups = {
+            chat_id: df[df["ChatID"].astype(str) == chat_id]
+            .sort_values(["TimestampUTC", "SourceRow"], kind="stable")
+            for chat_id in signal_chat_order
+        }
+        df = pd.concat([signal_chat_groups[k] for k in signal_chat_order], ignore_index=True)
+        _add_signal_contact_overview(doc, df, signal_report, font_name=font_name)
+
     for _, r in df.iterrows():
+        if signal_chat_groups:
+            chat_id = str(r.get("ChatID", ""))
+            if chat_id != current_signal_chat:
+                current_signal_chat = chat_id
+                doc.add_page_break()  # one conversation = a new section of the report
+                _add_signal_chat_header(
+                    doc, signal_chat_groups[chat_id], signal_report,
+                    signal_chat_order.index(chat_id) + 1, len(signal_chat_order),
+                    font_name=font_name
+                )
         raw_sender_val = r.get(col_sender, "")
         sender_raw = _normalize_participant(raw_sender_val)
 
@@ -2672,6 +2824,7 @@ class App(ctk.CTk):
                 extra_cols=(self.extra_cols_selected if self.extra_cols_selected else None),
                 media_path_col=media_col,
                 strict_media_lookup=(self.source_kind == "signal_json"),
+                signal_report=(self.signal_meta if self.source_kind == "signal_json" else None),
                 files_root=self.files_root_var.get().strip(),
                 search_subfolders=bool(self.search_subfolders_var.get()),
                 fuzzy_match=bool(self.fuzzy_match_var.get()),
