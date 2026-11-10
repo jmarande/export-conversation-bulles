@@ -70,3 +70,27 @@ Avant de publier des captures d'écran, exemples ou fichiers de test, veillez à
 Version actuelle : **LibreOffice V5**.
 
 Le projet est principalement développé et testé sous Windows avec export vers LibreOffice Writer.
+
+## Import Signal (JSON V2 déjà déchiffré)
+
+L'application conserve l'import Excel existant et propose maintenant **Ouvrir Signal JSON…**.
+Le fichier `conversations.json` est un export de conversations **déjà décodé**
+(par exemple par sigbackup), pas une base `signal.db` chiffrée.
+
+1. Ouvrir le JSON ; sélectionner, si demandé, le dossier `medias/` issu du même export.
+2. Choisir une conversation ou « Toutes les conversations » dans le menu déroulant.
+3. Vérifier les données en aperçu, les participants, la direction et les chemins médias.
+4. Exporter en DOCX Writer/Word. Les images sont insérées, les vidéos ont une miniature
+   lorsque ffmpeg est disponible, et les autres fichiers sont référencés.
+
+Les jointures médias utilisent **exclusivement** `attachments[].extractedPath` et le
+dossier médias choisi. Aucune correspondance approximative n'est autorisée dans ce mode.
+Les médias non inclus dans la sauvegarde sont signalés explicitement, sans les inventer.
+Les dates affichées sont converties de l'UTC vers Europe/Paris ; les horodatages ISO UTC
+et les références sources restent dans les colonnes importées.
+Le SHA-256 du JSON et le nom du snapshot sont ajoutés à la provenance du document.
+La déduplication est désactivée pour Signal afin de ne pas éliminer de preuves.
+
+L'import XML n'est **pas** encore pris en charge : il nécessite un exemple et un schéma
+de l'export concerné. Ne pas transmettre de clés Signal, de sauvegardes chiffrées ou de
+données sensibles sur GitHub. Les jeux de test du dépôt sont entièrement synthétiques.
