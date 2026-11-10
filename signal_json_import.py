@@ -42,6 +42,62 @@ def _relative_media_path(value):
     return PurePosixPath(value).as_posix()
 
 
+
+def _participants_index(data):
+    """Identify parties to exported chats, not all global address book entries."""
+    recipients = {str(r.get("id")): r for r in data.get("recipients") or [] if isinstance(r, dict)}
+    by_aci = {str(r.get("aci")): r for r in recipients.values() if r.get("aci")}
+    chat_ids = {str(c.get("id")) for c in data.get("chats") or [] if isinstance(c, dict)}
+    result = {}
+
+    def normalize(rec, role):
+        rec = rec if isinstance(rec, dict) else {}
+        return {
+            "id": str(rec.get("id") or ""),
+            "name": "Compte local (Signal)" if rec.get("type") == "self" or rec.get("self") else str(
+                rec.get("name") or rec.get("e164") or ("Compte " + str(rec.get("aci") or "non identifié"))
+            ),
+            "phone": str(rec.get("e164") or ""),
+            "aci": str(rec.get("aci") or ""),
+            "role": role
+        }
+
+    for chat in data.get("chats") or []:
+        if not isinstance(chat, dict):
+            continue
+        chat_id = str(chat.get("id"))
+        parties = {}
+        def add(rec, role):
+            person = normalize(rec, role)
+            key = person["aci"] or person["id"] or (person["name"] + "|" + person["phone"])
+            parties.setdefault(key, person)
+        for r in recipients.values():
+            if r.get("type") == "self":
+                add(r, "Compte local")
+        target = recipients.get(str(chat.get("recipientId")))
+        if isinstance(target, dict) and target.get("type") == "group":
+            for member in target.get("members") or []:
+                if not isinstance(member, dict):
+                    continue
+                aci = str(member.get("aci") or "")
+                profile = by_aci.get(aci, {"aci": aci, "name": "Compte Signal (nom non établi)"})
+                add(profile, "Membre du groupe")
+        elif isinstance(target, dict):
+            add(target, "Correspondant")
+
+        for msg in data.get("messages") or []:
+            if not isinstance(msg, dict) or str(msg.get("chatId")) != chat_id:
+                continue
+            author = msg.get("author")
+            if not isinstance(author, dict):
+                continue
+            profile = recipients.get(str(author.get("id")), author)
+            if author.get("self") or profile.get("type") == "self":
+                profile = {**profile, "self": True}
+            add(profile, "Auteur de message")
+        result[chat_id] = sorted(parties.values(), key=lambda p: (p["role"] != "Compte local", p["name"].lower()))
+    return result
+
 def load_signal_json(path):
     source = Path(path)
     raw = source.read_bytes()
@@ -121,6 +177,9 @@ def load_signal_json(path):
     rows.sort(key=lambda r: (r["TimestampUTC"], r["SourceRow"]))
     backup = data.get("backup") if isinstance(data.get("backup"), dict) else {}
     return rows, {
+        "participants_by_chat": _participants_index(data),
+        "chat_types": {str(c.get("id")): str(c.get("type") or "")
+                       for c in data.get("chats") or [] if isinstance(c, dict)},
         "source_sha256": sha256(raw).hexdigest(),
         "snapshot": backup.get("snapshot"),
         "backup_time": backup.get("backupTimeIso"),
