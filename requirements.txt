@@ -3,3 +3,4 @@ openpyxl
 customtkinter
 python-docx
 pillow
+tzdata>=2024.1

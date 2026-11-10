@@ -24,6 +24,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser, ttk
 from typing import Optional
+from signal_json_import import load_signal_json, inspect_media_paths
 
 import pandas as pd
 import customtkinter as ctk
@@ -595,6 +596,132 @@ def make_video_thumbnail(video_path: str, cache_dir: str) -> str | None:
 # -----------------------------
 # DOCX exporter
 # -----------------------------
+
+def _add_signal_contact_overview(doc, df, report, font_name="Calibri"):
+    """Documented conversation contacts only, before any message bubbles."""
+    chosen = list(dict.fromkeys(df["ChatID"].astype(str).tolist()))
+    directory = {}
+    for chat_id in chosen:
+        title_rows = df[df["ChatID"].astype(str) == chat_id]
+        chat_label = str(title_rows.iloc[0].get("Conversation", "Conversation " + chat_id))
+        for person in report.get("participants_by_chat", {}).get(chat_id, []):
+            if not isinstance(person, dict):
+                continue
+            key = str(person.get("aci") or person.get("id") or (
+                str(person.get("name", "")) + "|" + str(person.get("phone", ""))
+            ))
+            entry = directory.setdefault(key, {
+                "name": str(person.get("name") or "Compte non identifié"),
+                "phone": str(person.get("phone") or ""),
+                "aci": str(person.get("aci") or ""),
+                "chats": []
+            })
+            if chat_label not in entry["chats"]:
+                entry["chats"].append(chat_label)
+
+    header = doc.add_paragraph("Répertoire des contacts des conversations")
+    header.style = "Heading 1"
+    note = doc.add_paragraph(
+        "Cette liste concerne uniquement les participants ou auteurs recensés dans les "
+        "conversations sélectionnées. Les noms sont ceux indiqués par l'export Signal ; "
+        "ils ne constituent pas une identification civile certaine."
+    )
+    note.paragraph_format.space_after = Pt(8)
+
+    table = doc.add_table(rows=1, cols=4)
+    table.style = "Table Grid"
+    widths = [3.8, 3.0, 5.8, 5.0]
+    labels = ["Nom / compte", "Téléphone", "Identifiant Signal (ACI)", "Conversation(s)"]
+    for j, label in enumerate(labels):
+        cell = table.rows[0].cells[j]
+        cell.text = label
+        cell.width = Cm(widths[j])
+        set_cell_shading(cell, "253C59")
+        for p in cell.paragraphs:
+            for run in p.runs:
+                run.bold = True
+                run.font.color.rgb = RGBColor(255, 255, 255)
+                run.font.size = Pt(8)
+                run.font.name = font_name
+
+    # Repeat column headings when the contacts table spans multiple pages.
+    trPr = table.rows[0]._tr.get_or_add_trPr()
+    tbl_header = OxmlElement("w:tblHeader")
+    tbl_header.set(qn("w:val"), "true")
+    trPr.append(tbl_header)
+
+    people = sorted(directory.values(), key=lambda p: (p["name"] != "Compte local (Signal)", p["name"].lower()))
+    for person in people:
+        row = table.add_row()
+        values = [person["name"], person["phone"] or "Non renseigné",
+                  person["aci"] or "Non renseigné", "; ".join(person["chats"])]
+        for j, value in enumerate(values):
+            cell = row.cells[j]
+            cell.text = value
+            cell.width = Cm(widths[j])
+            for p in cell.paragraphs:
+                p.paragraph_format.space_after = Pt(0)
+                for run in p.runs:
+                    run.font.name = font_name
+                    run.font.size = Pt(7 if j in (2, 3) else 8)
+        set_row_cant_split(row)
+    if not people:
+        empty = table.add_row().cells
+        empty[0].text = "Aucun participant documenté dans les métadonnées"
+    doc.add_paragraph(
+        f"Contacts/comptes listés : {len(people)}. Conversations sélectionnées : {len(chosen)}."
+    ).style = "Caption"
+
+
+def _add_signal_chat_header(doc, chat_rows, report, ordinal, total, font_name="Calibri"):
+    """A clear title and chat-specific participant/date box on a new page."""
+    row = chat_rows.iloc[0]
+    chat_id = str(row.get("ChatID", ""))
+    name = str(row.get("Conversation", "Conversation " + chat_id))
+    kind = str(report.get("chat_types", {}).get(chat_id, ""))
+    dates = chat_rows.sort_values(["TimestampUTC", "SourceRow"], kind="stable")
+    dated = dates[dates["TimestampUTC"].astype(str).str.strip() != ""]
+    start = str(dated.iloc[0]["Timestamp"]) if not dated.empty else "Non documentée"
+    end = str(dated.iloc[-1]["Timestamp"]) if not dated.empty else "Non documentée"
+    people = report.get("participants_by_chat", {}).get(chat_id, [])
+    participants = ", ".join(str(p.get("name") or "Compte non identifié") for p in people)
+    if not participants:
+        participants = ", ".join(sorted(set(chat_rows["From"].astype(str))))
+
+    p = doc.add_paragraph()
+    p.style = "Heading 1"
+    p.add_run(f"Conversation {ordinal} / {total} — {name}")
+    p.paragraph_format.space_after = Pt(8)
+
+    details = doc.add_table(rows=0, cols=2)
+    details.style = "Table Grid"
+    attributes = [
+        ("Nature", "Groupe Signal" if kind == "group" else "Conversation individuelle" if kind == "contact" else (kind or "Non précisée")),
+        ("Participants / auteurs", participants),
+        ("Premier élément daté", start),
+        ("Dernier élément daté", end),
+        ("Éléments présentés", str(len(chat_rows))),
+    ]
+    for label, value in attributes:
+        cells = details.add_row().cells
+        cells[0].text, cells[1].text = label, value
+        cells[0].width = Cm(4)
+        for pp in cells[0].paragraphs:
+            for run in pp.runs:
+                run.bold = True
+        for cell in cells:
+            for pp in cell.paragraphs:
+                pp.paragraph_format.space_after = Pt(0)
+                for run in pp.runs:
+                    run.font.name = font_name
+                    run.font.size = Pt(9)
+
+    subtitle = doc.add_paragraph("Échanges et événements présents dans l'export")
+    subtitle.style = "Heading 2"
+    subtitle.paragraph_format.space_before = Pt(10)
+    subtitle.paragraph_format.space_after = Pt(6)
+
+
 def export_chat_to_docx(
     df: pd.DataFrame,
     out_path: str,
@@ -639,6 +766,8 @@ def export_chat_to_docx(
     sender_font_size: int = 9,
     msg_font_size: int = 10,
     meta_font_size: int = 8,
+    strict_media_lookup: bool = False,
+    signal_report: dict | None = None,
 ):
     doc = Document()
 
@@ -723,7 +852,32 @@ def export_chat_to_docx(
     bubble_spacing_pt = float(bubble_spacing_pt)
     bubble_spacing_pt = max(0.0, min(bubble_spacing_pt, 40.0))
 
+    signal_chat_groups = {}
+    current_signal_chat = None
+    signal_chat_order = []
+    if signal_report and "ChatID" in df.columns and not df.empty:
+        # Reorganize per conversation, keeping the original message order
+        # within each conversation (stable UTC timestamp/source row).
+        signal_chat_order = list(dict.fromkeys(df["ChatID"].astype(str).tolist()))
+        signal_chat_groups = {
+            chat_id: df[df["ChatID"].astype(str) == chat_id]
+            .sort_values(["TimestampUTC", "SourceRow"], kind="stable")
+            for chat_id in signal_chat_order
+        }
+        df = pd.concat([signal_chat_groups[k] for k in signal_chat_order], ignore_index=True)
+        _add_signal_contact_overview(doc, df, signal_report, font_name=font_name)
+
     for _, r in df.iterrows():
+        if signal_chat_groups:
+            chat_id = str(r.get("ChatID", ""))
+            if chat_id != current_signal_chat:
+                current_signal_chat = chat_id
+                doc.add_page_break()  # one conversation = a new section of the report
+                _add_signal_chat_header(
+                    doc, signal_chat_groups[chat_id], signal_report,
+                    signal_chat_order.index(chat_id) + 1, len(signal_chat_order),
+                    font_name=font_name
+                )
         raw_sender_val = r.get(col_sender, "")
         sender_raw = _normalize_participant(raw_sender_val)
 
@@ -832,10 +986,18 @@ def export_chat_to_docx(
 
         # Medias
         for media_name in media_values:
-            resolved = (
-                resolve_media_path(media_name, files_root, recursive=search_subfolders, fuzzy=fuzzy_match)
-                or resolve_media_path(media_name, str(out_dir), recursive=True, fuzzy=True)
-            )
+            if strict_media_lookup:
+                # Signal media: exact path only, never associate by fuzzy name.
+                rel_path = Path(media_name)
+                resolved = None
+                if files_root and not rel_path.is_absolute() and ".." not in rel_path.parts:
+                    candidate = Path(files_root) / rel_path
+                    resolved = str(candidate) if candidate.is_file() else None
+            else:
+                resolved = (
+                    resolve_media_path(media_name, files_root, recursive=search_subfolders, fuzzy=fuzzy_match)
+                    or resolve_media_path(media_name, str(out_dir), recursive=True, fuzzy=True)
+                )
 
             p_media = bubble_cell.add_paragraph()
             compact_paragraph(p_media)
@@ -980,11 +1142,14 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
-        self.title("Export conversation Excel -> LibreOffice Writer (bulles V4) — Dark Pro")
+        self.title("Export conversation Excel / Signal -> LibreOffice Writer (bulles) — Dark Pro")
         self.geometry("1500x880")
         self.minsize(1200, 720)
 
         self.excel_path: str | None = None
+        self.source_kind = "excel"
+        self.signal_rows: list[dict] = []
+        self.signal_meta: dict = {}
         self.df: pd.DataFrame | None = None
         self.sheets: list[str] = []
 
@@ -1145,8 +1310,11 @@ class App(ctk.CTk):
         self.refresh_current_sheet()
 
     def refresh_current_sheet(self):
-        """Rafraîchit la feuille courante (relecture Excel + mise à jour UI)."""
+        """Rafraîchit la feuille Excel ou le filtre de conversation Signal."""
         if not self.excel_path:
+            return
+        if self.source_kind == "signal_json":
+            self.load_sheet()
             return
 
         try:
@@ -1179,9 +1347,12 @@ class App(ctk.CTk):
         top.pack(fill="x", padx=12, pady=12)
 
         ctk.CTkButton(top, text="Ouvrir Excel…", width=140, command=self.open_excel).pack(
-            side="left", padx=12, pady=10
+            side="left", padx=(12, 4), pady=10
         )
-        ctk.CTkLabel(top, text="Feuille").pack(side="left", padx=(12, 8))
+        ctk.CTkButton(top, text="Ouvrir Signal JSON…", width=155, command=self.open_signal_json).pack(
+            side="left", padx=(0, 8), pady=10
+        )
+        ctk.CTkLabel(top, text="Feuille / conversation").pack(side="left", padx=(8, 8))
 
         self.sheet_menu = ctk.CTkOptionMenu(top, variable=self.sheet_var, values=[""], command=self.on_sheet_change)
         self.sheet_menu.pack(side="left", pady=10)
@@ -1982,6 +2153,9 @@ class App(ctk.CTk):
         if not path:
             return
 
+        self.source_kind = "excel"
+        self.signal_rows = []
+        self.signal_meta = {}
         self.excel_path = path
         self.lbl_file.configure(text=os.path.basename(path))
 
@@ -1994,15 +2168,83 @@ class App(ctk.CTk):
             self.sheet_var.set("")
         self.load_sheet()
 
+    def open_signal_json(self):
+        path = filedialog.askopenfilename(
+            title="Choisir un export Signal conversations.json",
+            filetypes=[("Export Signal JSON", "*.json"), ("Tous fichiers", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            rows, metadata = load_signal_json(path)
+            if not rows:
+                raise ValueError("Le fichier ne contient aucun enregistrement de conversation.")
+        except Exception as exc:
+            messagebox.showerror("Import Signal", f"Fichier Signal non exploitable :\n{exc}")
+            return
+
+        # sigbackup typically exports JSON next to the medias/ directory.
+        folder = Path(path).parent
+        possible_roots = [folder / "medias", folder.parent / "medias", folder.parent / "Exports" / "medias"]
+        media_root = next((candidate for candidate in possible_roots if candidate.is_dir()), None)
+        if media_root is None:
+            choice = filedialog.askdirectory(
+                title="Choisir le dossier des médias Signal extraits (annuler = messages seuls)",
+                initialdir=str(folder)
+            )
+            media_root = Path(choice) if choice else None
+
+        self.source_kind = "signal_json"
+        self.excel_path = path
+        self.signal_rows = rows
+        self.signal_meta = metadata
+        self.sheets = ["Toutes les conversations"] + sorted(metadata["per_chat"])
+        self.sheet_menu.configure(values=self.sheets)
+        self.sheet_var.set(self.sheets[0])
+        self.col_sender_var.set("From")
+        self.col_msg_var.set("Body")
+        self.col_dir_var.set("Direction")
+        self.ts_single_var.set("Timestamp")
+        self.ts_mode_var.set("single")
+        self.media_col_var.set("MediaPath")
+        self.side_mode_var.set("direction")
+        self.dedupe_var.set(False)  # Ne pas fusionner des éléments de preuve.
+        self.extra_cols_selected = ["Citation", "Reactions"]
+        self.files_root_var.set(str(media_root) if media_root else "")
+        self.search_subfolders_var.set(False)
+        self.fuzzy_match_var.set(False)
+        self.lbl_file.configure(text=f"Signal : {Path(path).name} ({len(rows)} éléments)")
+        self.load_sheet()
+
+        if media_root:
+            stats = inspect_media_paths(rows, media_root)
+            if stats["missing"]:
+                messagebox.showwarning(
+                    "Médias Signal",
+                    f"{stats['found']}/{stats['expected']} chemins médias résolus exactement.\n"
+                    "Vérifier le dossier des médias dans l'onglet Fichier."
+                )
+        else:
+            messagebox.showinfo(
+                "Médias Signal",
+                "Les messages sont importés. Sélectionner le dossier médias dans l'onglet Fichier "
+                "avant l'export DOCX pour joindre les fichiers."
+            )
+
     def load_sheet(self):
         if not self.excel_path:
             return
 
         sheet = self.sheet_var.get() if self.sheet_var.get() else None
         try:
-            self.df = load_excel_smart(self.excel_path, sheet_name=sheet)
+            if self.source_kind == "signal_json":
+                self.df = pd.DataFrame(self.signal_rows)
+                if sheet and sheet != "Toutes les conversations":
+                    self.df = self.df[self.df["Conversation"] == sheet].copy()
+            else:
+                self.df = load_excel_smart(self.excel_path, sheet_name=sheet)
         except Exception as e:
-            messagebox.showerror("Erreur", f"Impossible de lire l'Excel:\n{e}")
+            messagebox.showerror("Erreur", f"Impossible de charger les conversations :\n{e}")
             return
 
         cols = list(self.df.columns)
@@ -2528,7 +2770,7 @@ class App(ctk.CTk):
 
         df_to_export = self.df
         removed_dupes = 0
-        if self.dedupe_var.get():
+        if self.dedupe_var.get() and self.source_kind != "signal_json":
             try:
                 before_n = int(len(df_to_export))
                 df_to_export = dedupe_messages_option_b(df_to_export, col_sender, col_msg, ts_series)
@@ -2542,6 +2784,17 @@ class App(ctk.CTk):
                 "Doublons supprimés",
                 f"{removed_dupes} ligne(s) supprimée(s) (doublons).\nLignes restantes: {len(df_to_export)}"
             )
+
+        if self.source_kind == "signal_json":
+            metadata = self.signal_meta
+            provenance = (
+                "Source : export secondaire Signal JSON ; "
+                f"SHA-256 : {metadata.get('source_sha256', 'non calculé')} ; "
+                f"sauvegarde : {metadata.get('snapshot', 'non documentée')}. "
+                "Horodatages affichés en heure française ; originaux UTC dans le JSON. "
+                "Export non exhaustif de l'état du téléphone."
+            )
+            intro_text = provenance + ("\n" + intro_text if intro_text else "")
 
         status_col = self.status_col_var.get().strip() or None
         status_map = self.status_map if self.show_status_var.get() else {}
@@ -2570,6 +2823,8 @@ class App(ctk.CTk):
                 bubble_spacing_pt=bubble_spacing,
                 extra_cols=(self.extra_cols_selected if self.extra_cols_selected else None),
                 media_path_col=media_col,
+                strict_media_lookup=(self.source_kind == "signal_json"),
+                signal_report=(self.signal_meta if self.source_kind == "signal_json" else None),
                 files_root=self.files_root_var.get().strip(),
                 search_subfolders=bool(self.search_subfolders_var.get()),
                 fuzzy_match=bool(self.fuzzy_match_var.get()),
